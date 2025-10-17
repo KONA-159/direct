@@ -294,7 +294,8 @@ class H5SliceData(Dataset):
             for extra_key in self.extra_keys:
                 if extra_key == "attrs":
                     raise ValueError("attrs need to be passed by setting `pass_attrs = True`.")
-                extra_data[extra_key] = data[extra_key][()]
+                if extra_key in data:
+                    extra_data[extra_key] = data[extra_key][()]
         data.close()
         return curr_data, extra_data
 

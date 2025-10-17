@@ -378,25 +378,35 @@ class FastMRIDataset(H5SliceData):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         sample = super().__getitem__(idx)
 
-        if self.pass_attrs:
-            sample["scaling_factor"] = sample["attrs"]["max"]
-            del sample["attrs"]
+        if sample["kspace"].shape[-1] == 2:  # if complex data stored as two separate channels in the h5 file.
+            sample["kspace"] = sample["kspace"][..., 0] + 1j * sample["kspace"][..., 1]
 
-        sample.update(_parse_fastmri_header(sample["ismrmrd_header"]))
-        del sample["ismrmrd_header"]
-        # Some images have strange behavior, e.g. FLAIR 203.
+        if self.pass_attrs:
+            if "attrs" in sample and "max" in sample["attrs"]:
+                sample["scaling_factor"] = sample["attrs"]["max"]
+                del sample["attrs"]
+
+        if "ismrmrd_header" in sample:
+            sample.update(_parse_fastmri_header(sample["ismrmrd_header"]))
+            del sample["ismrmrd_header"]
+
         image_shape = sample["kspace"].shape
-        if image_shape[-1] < sample["reconstruction_size"][-2]:  # reconstruction size is (x, y, z)
-            sample["reconstruction_size"] = (image_shape[-1], image_shape[-1], 1)
+
+        if "reconstruction_size" in sample:
+            if image_shape[-1] < sample["reconstruction_size"][-2]:  # reconstruction size is (x, y, z)
+                sample["reconstruction_size"] = (image_shape[-1], image_shape[-1], 1)
+        else:
+            sample["reconstruction_size"] = (image_shape[-2], image_shape[-1], 1)
 
         if self.pass_mask:
             # mask should be shape (1, h, w, 1) mask provided is only w
             kspace_shape = sample["kspace"].shape
             sampling_mask = sample["mask"]
 
-            # Mask needs to be padded.
-            sampling_mask[: sample["padding_left"]] = 0
-            sampling_mask[sample["padding_right"] :] = 0
+            if "padding_left" in sample:
+                sampling_mask[: sample["padding_left"]] = 0
+            if "padding_right" in sample:
+                sampling_mask[sample["padding_right"] :] = 0
 
             sampling_mask = sampling_mask.reshape(1, -1)
             del sample["mask"]
@@ -404,10 +414,11 @@ class FastMRIDataset(H5SliceData):
             sample["sampling_mask"] = self.__broadcast_mask(kspace_shape, sampling_mask)
             sample["acs_mask"] = self.__broadcast_mask(kspace_shape, self.__get_acs_from_fastmri_mask(sampling_mask))
 
-        # Explicitly zero-out the outer parts of kspace which are padded
-        sample["kspace"] = self.explicit_zero_padding(
-            sample["kspace"], sample["padding_left"], sample["padding_right"]
-        )
+        if "padding_left" in sample and "padding_right" in sample:
+            # Explicitly zero-out the outer parts of kspace which are padded
+            sample["kspace"] = self.explicit_zero_padding(
+                sample["kspace"], sample["padding_left"], sample["padding_right"]
+            )
 
         if self.transform:
             sample = self.transform(sample)
