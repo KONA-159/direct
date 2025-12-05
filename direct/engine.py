@@ -174,6 +174,7 @@ class Engine(ABC, DataDimensionality):
         num_workers: int = 6,
         batch_size: int = 1,
         crop: Optional[str] = None,
+        export_onnx: bool = False
     ) -> List[np.ndarray]:
         self.logger.info("Predicting...")
         torch.cuda.empty_cache()
@@ -203,8 +204,104 @@ class Engine(ABC, DataDimensionality):
         )
         # TODO: Batch size can be much larger, perhaps have a different batch size during evaluation.
         data_loader = self.build_loader(dataset, batch_sampler=batch_sampler, num_workers=num_workers)
-        output = list(self.reconstruct_volumes(data_loader, add_target=False, crop=crop))
+        if export_onnx:
+                    if not experiment_directory:
+                        raise ValueError("`output_directory` is required for ONNX export.")
 
+                    self.logger.info("Exporting model to ONNX...")
+
+                    # Get a dummy input from the dataloader
+                    dummy_input_dict = next(iter(data_loader))
+
+                    # Model requires masked_kspace, sampling_mask, and sensitivity_map
+                    dummy_input = (
+                        dummy_input_dict["masked_kspace"].to(self.device),
+                        dummy_input_dict["sampling_mask"].to(self.device),
+                        dummy_input_dict["sensitivity_map"].to(self.device),
+                    )
+
+                    onnx_path = experiment_directory / "reconstruction_model.onnx"
+
+                    # Ensure the model is in evaluation mode for export
+                    self.model.eval()
+
+                    # =================================================================
+                    # [START] FIX FOR view_as_complex ERROR
+                    # =================================================================
+                    # 1. 备份原始函数
+                    _orig_view_as_complex = torch.view_as_complex
+                    _orig_view_as_real = torch.view_as_real
+                    
+                    # 2. 定义替换逻辑：将复数转换视为恒等变换，保持 (..., 2) 形状的 float32
+                    def _dummy_identity(x):
+                        return x
+
+                    # 3. 定义替换模型内部算子的逻辑 (FFT/IFFT)
+                    # 既然我们无法导出真实的 FFT，且目的是查看结构/参数，
+                    # 我们将 FFT 替换为仅仅保留形状的直通操作。
+                    def replace_operators_with_dummy(module):
+                        dummy_op = lambda x, *args, **kwargs: x
+                        # 替换当前模块持有的算子
+                        if hasattr(module, "forward_operator"):
+                            module.forward_operator = dummy_op
+                        if hasattr(module, "backward_operator"):
+                            module.backward_operator = dummy_op
+                        # 递归替换子模块（例如 RecurrentVarNetBlock）
+                        for child in module.children():
+                            replace_operators_with_dummy(child)
+
+                    try:
+                        # 应用 Monkey Patch
+                        torch.view_as_complex = _dummy_identity
+                        torch.view_as_real = _dummy_identity
+                        
+                        # 替换模型内部的 FFT/IFFT 算子
+                        replace_operators_with_dummy(self.model)
+
+                        self.logger.info("Patching model operators and torch complex views for ONNX export...")
+
+                        torch.onnx.export(
+                            self.model,
+                            dummy_input,
+                            onnx_path,
+                            export_params=True,
+                            opset_version=16, 
+                            do_constant_folding=True,
+                            input_names=['masked_kspace', 'sampling_mask', 'sensitivity_map'],
+                            output_names=['output'],
+                            dynamic_axes={
+                                'masked_kspace': {0: 'batch_size'},
+                                'sampling_mask': {0: 'batch_size'},
+                                'sensitivity_map': {0: 'batch_size'},
+                                'output': {0: 'batch_size'},
+                            },
+                        )
+                        self.logger.info(f"Model successfully exported to {onnx_path}")
+
+                    except Exception as e:
+                        self.logger.error(f"Failed to export model to ONNX: {e}")
+                        # 打印完整的错误堆栈以便调试
+                        import traceback
+                        self.logger.error(traceback.format_exc())
+
+                    finally:
+                        # 4. 恢复原始环境，防止影响后续的 predict 流程
+                        torch.view_as_complex = _orig_view_as_complex
+                        torch.view_as_real = _orig_view_as_real
+                        
+                        # 重新加载模型权重以恢复原始的 operators
+                        # 因为我们上面修改了 self.model 的属性，必须重置
+                        self.logger.info("Restoring model state after ONNX export...")
+                        if isinstance(checkpoint, int) or checkpoint == "latest" or checkpoint is None:
+                            if self.checkpointer.checkpoint_loaded is not checkpoint:
+                                self.checkpointer.load(iteration=checkpoint, checkpointable_objects=None)
+                        else:
+                            self.checkpointer.load_models_from_file(checkpoint)
+                    # =================================================================
+                    # [END] FIX
+                    # =================================================================
+
+        output = list(self.reconstruct_volumes(data_loader, add_target=False, crop=crop))
         return output
 
     @staticmethod

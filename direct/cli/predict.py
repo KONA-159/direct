@@ -90,5 +90,10 @@ def register_parser(parser: argparse._SubParsersAction):
         type=str,
         default="",
     )
+    predict_parser.add_argument(
+        "--export-onnx",
+        action="store_true",
+        help="Export the loaded model to ONNX format. The file will be saved in the output directory.",
+    )
 
     predict_parser.set_defaults(subcommand=predict_from_argparse)

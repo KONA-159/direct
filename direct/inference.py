@@ -46,6 +46,7 @@ def setup_inference_save_to_h5(
     mixed_precision: bool = False,
     debug: bool = False,
     is_validation: bool = False,
+    export_onnx: bool = False,
 ) -> None:
     """This function contains most of the logic in DIRECT required to launch a multi-gpu / multi-node inference process.
 
@@ -85,6 +86,8 @@ def setup_inference_save_to_h5(
     is_validation: bool
         If True, will use settings (e.g. `batch_size` & `crop`) of `validation` in config.
         Otherwise it will use `inference` settings. Default: False.
+    export_onnx: bool
+        If True, the model will be exported to ONNX format. Default: False.
 
     Returns
     -------
@@ -126,6 +129,7 @@ def setup_inference_save_to_h5(
             filenames_filter=curr_filenames_filter,
             batch_size=batch_size,
             crop=crop,
+            export_onnx=export_onnx
         )
 
         # Perhaps aggregation to the main process would be most optimal here before writing.
@@ -160,6 +164,7 @@ def inference_on_environment(
     filenames_filter: Union[List[PathOrString], None] = None,
     batch_size: int = 1,
     crop: Optional[str] = None,
+    export_onnx: bool = False
 ) -> Union[Dict, DefaultDict]:
     """Performs inference on environment.
 
@@ -184,6 +189,8 @@ def inference_on_environment(
         Inference batch size. Default: 1.
     crop: Optional[str]
         Inference crop type. Can be `header` or None. Default: None.
+    export_onnx: bool
+        If True, the model will be exported to ONNX format. Default: False.
 
     Returns
     -------
@@ -214,5 +221,6 @@ def inference_on_environment(
         num_workers=num_workers,
         batch_size=batch_size,
         crop=crop,
+        export_onnx=export_onnx,
     )
     return output
