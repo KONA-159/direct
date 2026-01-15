@@ -22,7 +22,7 @@ from direct.config import BaseConfig
 from direct.nn.mri_models import MRIModelEngine
 
 
-class RecurrentVarNetEngine(MRIModelEngine):
+class GLAVarNetEngine(MRIModelEngine):
     """Recurrent Variational Network Engine."""
 
     def __init__(
@@ -35,7 +35,7 @@ class RecurrentVarNetEngine(MRIModelEngine):
         mixed_precision: bool = False,
         **models: nn.Module,
     ):
-        """Inits :class:`RecurrentVarNetEngine."""
+        """Inits :class:`GLAVarNetEngine."""
         super().__init__(
             cfg,
             model,

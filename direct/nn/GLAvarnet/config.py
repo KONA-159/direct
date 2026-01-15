@@ -19,7 +19,7 @@ from direct.nn.types import InitType
 
 
 @dataclass
-class RecurrentVarNetConfig(ModelConfig):
+class GLAVarNetConfig(ModelConfig):
     num_steps: int = 15  # :math:`T`
     recurrent_hidden_channels: int = 64
     recurrent_num_layers: int = 4  # :math:`n_l`

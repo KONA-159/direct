@@ -27,8 +27,8 @@ from direct.nn.types import InitType
 class RecurrentInit(nn.Module):
     """Recurrent State Initializer (RSI) module of Recurrent Variational Network as presented in [1]_.
 
-    The RSI module learns to initialize the recurrent hidden state :math:`h_0`, input of the first RecurrentVarNetBlock
-    of the RecurrentVarNet.
+    The RSI module learns to initialize the recurrent hidden state :math:`h_0`, input of the first GLAVarNetBlock
+    of the GLAVarNet.
 
     References
     ----------
@@ -54,13 +54,13 @@ class RecurrentInit(nn.Module):
         in_channels: int
             Input channels.
         out_channels: int
-            Number of hidden channels of the recurrent unit of RecurrentVarNet Block.
+            Number of hidden channels of the recurrent unit of GLAVarNet Block.
         channels: tuple
             Channels :math:`n_d` in the convolutional layers of initializer.
         dilations: tuple
             Dilations :math:`p` of the convolutional layers of the initializer.
         depth: int
-            RecurrentVarNet Block number of layers :math:`n_l`.
+            GLAVarNet Block number of layers :math:`n_l`.
         multiscale_depth: 1
             Number of feature layers to aggregate for the output, if 1, multi-scale context aggregation is disabled.
         """
@@ -112,7 +112,7 @@ class RecurrentInit(nn.Module):
         return out
 
 
-class RecurrentVarNet(nn.Module):
+class GLAVarNet(nn.Module):
     """Recurrent Variational Network implementation as presented in [1]_.
 
     References
@@ -140,7 +140,7 @@ class RecurrentVarNet(nn.Module):
         normalized: bool = False,
         **kwargs,
     ):
-        """Inits :class:`RecurrentVarNet`.
+        """Inits :class:`GLAVarNet`.
 
         Parameters
         ----------
@@ -153,11 +153,11 @@ class RecurrentVarNet(nn.Module):
         in_channels: int
             Input channel number. Default is 2 for complex data.
         recurrent_hidden_channels: int
-            Hidden channels number for the recurrent unit of the RecurrentVarNet Blocks. Default: 64.
+            Hidden channels number for the recurrent unit of the GLAVarNet Blocks. Default: 64.
         recurrent_num_layers: int
-            Number of layers for the recurrent unit of the RecurrentVarNet Block (:math:`n_l`). Default: 4.
+            Number of layers for the recurrent unit of the GLAVarNet Block (:math:`n_l`). Default: 4.
         no_parameter_sharing: bool
-            If False, the same :class:`RecurrentVarNetBlock` is used for all num_steps. Default: True.
+            If False, the same :class:`GLAVarNetBlock` is used for all num_steps. Default: True.
         learned_initializer: bool
             If True an RSI module is used. Default: False.
         initializer_initialization: str, Optional
@@ -171,7 +171,7 @@ class RecurrentVarNet(nn.Module):
             RSI module number of feature layers to aggregate for the output, if 1, multi-scale context aggregation
             is disabled. Default: 1.
         normalized: bool
-            If True, :class:`NormConv2dGRU` will be used as a regularizer in the :class:`RecurrentVarNetBlocks`.
+            If True, :class:`NormConv2dGRU` will be used as a regularizer in the :class:`GLAVarNetBlocks`.
             Default: False.
         """
         super().__init__()
@@ -213,7 +213,7 @@ class RecurrentVarNet(nn.Module):
         self.block_list = nn.ModuleList()
         for _ in range(self.num_steps if self.no_parameter_sharing else 1):
             self.block_list.append(
-                RecurrentVarNetBlock(
+                GLAVarNetBlock(
                     forward_operator=forward_operator,
                     backward_operator=backward_operator,
                     in_channels=in_channels,
@@ -262,7 +262,7 @@ class RecurrentVarNet(nn.Module):
         sensitivity_map: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        """Computes forward pass of :class:`RecurrentVarNet`.
+        """Computes forward pass of :class:`GLAVarNet`.
 
         Parameters
         ----------
@@ -501,16 +501,10 @@ class GLARecurrentUnit(nn.Module):
         return out, new_hidden_states
 
 
-class RecurrentVarNetBlock(nn.Module):
-    r"""Recurrent Variational Network Block :math:`\mathcal{H}_{\theta_{t}}` as presented in [1]_.
-
-    References
-    ----------
-
-    .. [1] Yiasemis, George, et al. “Recurrent Variational Network: A Deep Learning Inverse Problem Solver Applied to
-        the Task of Accelerated MRI Reconstruction.” ArXiv:2111.09639 [Physics], Nov. 2021. arXiv.org,
-        http://arxiv.org/abs/2111.09639.
-
+class GLAVarNetBlock(nn.Module):
+    r"""Gated Linear Attention Variational Network Block :math:`\mathcal{H}_{\theta_{t}}`.
+    
+    This block uses GLARecurrentUnit instead of Conv2dGRU.
     """
 
     def __init__(
@@ -522,7 +516,7 @@ class RecurrentVarNetBlock(nn.Module):
         num_layers: int = 4,
         normalized: bool = False,
     ):
-        """Inits RecurrentVarNetBlock.
+        """Inits GLAVarNetBlock.
 
         Parameters
         ----------
@@ -563,7 +557,7 @@ class RecurrentVarNetBlock(nn.Module):
         coil_dim: int = 1,
         spatial_dims: Tuple[int, int] = (2, 3),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Computes forward pass of RecurrentVarNetBlock.
+        """Computes forward pass of GLAVarNetBlock.
 
         Parameters
         ----------
