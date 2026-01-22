@@ -340,14 +340,15 @@ class GatedLinearAttention(nn.Module):
         self.hidden_channels = hidden_channels
         self.scale = hidden_channels**-0.5
 
+        # Normalization for stability
+        self.norm = nn.GroupNorm(num_groups=8, num_channels=hidden_channels)
+
         # Projections for Q, K, V
         self.to_q = nn.Conv2d(hidden_channels, hidden_channels, 1)
         self.to_k = nn.Conv2d(hidden_channels, hidden_channels, 1)
         self.to_v = nn.Conv2d(hidden_channels, hidden_channels, 1)
 
         # Gating mechanisms
-        # lambda_gate: Forget gate (0~1)
-        # input_gate: Input importance gate (0~1)
         self.to_gates = nn.Conv2d(hidden_channels, hidden_channels * 2, 1)
 
         # Final projection
@@ -374,12 +375,15 @@ class GatedLinearAttention(nn.Module):
         B, C, H, W = x.shape
         N = H * W
 
-        # 1. Project inputs to Q, K, V, and Gates
-        q = self.to_q(x).view(B, C, N)  # (B, C, N)
-        k = self.to_k(x).view(B, C, N)  # (B, C, N)
-        v = self.to_v(x).view(B, C, N)  # (B, C, N)
+        # 0. Normalization
+        x_norm = self.norm(x)
 
-        gates = self.to_gates(x).view(B, 2 * C, N)
+        # 1. Project inputs to Q, K, V, and Gates
+        q = self.to_q(x_norm).view(B, C, N) * self.scale  # Apply scale for stability
+        k = self.to_k(x_norm).view(B, C, N)
+        v = self.to_v(x_norm).view(B, C, N)
+
+        gates = self.to_gates(x_norm).view(B, 2 * C, N)
         forget_gate_spatial, input_gate_spatial = gates.chunk(2, dim=1)
         forget_gate_spatial = torch.sigmoid(forget_gate_spatial)  # lambda_t (B, C, N)
         input_gate_spatial = torch.sigmoid(input_gate_spatial)  # i_t (B, C, N)
@@ -391,7 +395,8 @@ class GatedLinearAttention(nn.Module):
         # Shape: (B, C, N) @ (B, N, C) -> (B, C, C)
         # Note: (i * K) is element-wise.
         k_gated = k * input_gate_spatial  # (B, C, N)
-        new_knowledge = torch.bmm(k_gated, v.transpose(1, 2))  # (B, C, C)
+        # Normalize by N to prevent memory explosion with large images
+        new_knowledge = torch.bmm(k_gated, v.transpose(1, 2)) / N  # (B, C, C)
 
         # 3. Update Global Memory
         # Compute global forgetting factor.
