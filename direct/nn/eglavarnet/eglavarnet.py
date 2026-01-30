@@ -24,103 +24,130 @@ from direct.nn.recurrent.recurrent import Conv2dGRU, NormConv2dGRU
 from direct.nn.types import InitType
 
 
-class RecurrentInit(nn.Module):
-    """Recurrent State Initializer (RSI) module of Recurrent Variational Network as presented in [1]_.
+class ChannelAttention(nn.Module):
+    """Channel Attention Layer (SE-style) inspired by PromptMR's CALayer."""
 
-    The RSI module learns to initialize the recurrent hidden state :math:`h_0`, input of the first GLAVarNetBlock
-    of the GLAVarNet.
-
-    References
-    ----------
-
-    .. [1] Yiasemis, George, et al. “Recurrent Variational Network: A Deep Learning Inverse Problem Solver Applied to
-        the Task of Accelerated MRI Reconstruction.” ArXiv:2111.09639 [Physics], Nov. 2021. arXiv.org,
-        http://arxiv.org/abs/2111.09639.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        channels: Tuple[int, ...],
-        dilations: Tuple[int, ...],
-        depth: int = 2,
-        multiscale_depth: int = 1,
-    ):
-        """Inits :class:`RecurrentInit`.
-
-        Parameters
-        ----------
-        in_channels: int
-            Input channels.
-        out_channels: int
-            Number of hidden channels of the recurrent unit of GLAVarNet Block.
-        channels: tuple
-            Channels :math:`n_d` in the convolutional layers of initializer.
-        dilations: tuple
-            Dilations :math:`p` of the convolutional layers of the initializer.
-        depth: int
-            GLAVarNet Block number of layers :math:`n_l`.
-        multiscale_depth: 1
-            Number of feature layers to aggregate for the output, if 1, multi-scale context aggregation is disabled.
-        """
+    def __init__(self, channel: int, reduction: int = 4):
         super().__init__()
-
-        self.conv_blocks = nn.ModuleList()
-        self.out_blocks = nn.ModuleList()
-        self.depth = depth
-        self.multiscale_depth = multiscale_depth
-        tch = in_channels
-        for curr_channels, curr_dilations in zip(channels, dilations):
-            block = [
-                nn.ReplicationPad2d(curr_dilations),
-                nn.Conv2d(tch, curr_channels, 3, padding=0, dilation=curr_dilations),
-            ]
-            tch = curr_channels
-            self.conv_blocks.append(nn.Sequential(*block))
-        tch = np.sum(channels[-multiscale_depth:])
-        for _ in range(depth):
-            block = [nn.Conv2d(tch, out_channels, 1, padding=0)]
-            self.out_blocks.append(nn.Sequential(*block))
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv_du = nn.Sequential(
+            nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=False),
+            nn.Sigmoid(),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Computes initialization for recurrent unit given input `x`.
+        y = self.avg_pool(x)
+        y = self.conv_du(y)
+        return x * y
 
-        Parameters
-        ----------
-        x: torch.Tensor
-            Initialization for RecurrentInit.
 
-        Returns
-        -------
-        out: torch.Tensor
-            Initial recurrent hidden state from input `x`.
+class PromptGenerator(nn.Module):
+    """Visual Prompt Generator for EGLAVarNet with Low-Rank Memory Initialization.
+    
+    This module extracts multi-scale features, applies global channel attention,
+    and composes the initial memory matrix M0 using a low-rank decomposition strategy (M0 = U * V^T).
+    This enforces a structural prior on the initial state, capturing essential 
+    reconstruction patterns while suppressing high-rank noise.
+    """
+
+    def __init__(self, in_channels: int, hidden_channels: int, num_components: int = 8, rank: int = 16):
         """
+        Args:
+            in_channels: Input channels (usually 2 for complex image).
+            hidden_channels: Dimension of the GLA hidden state (C).
+            num_components: Number of learnable memory templates.
+            rank: The rank (r) of the memory initialization. r << C.
+        """
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.num_components = num_components
+        self.rank = rank
+        
+        # Low-rank Memory Bank: Instead of C*C, we learn U and V bases.
+        # Shape: (N_components, C, rank)
+        self.u_bank = nn.Parameter(
+            torch.randn(num_components, hidden_channels, rank) * 0.02
+        )
+        self.v_bank = nn.Parameter(
+            torch.randn(num_components, hidden_channels, rank) * 0.02
+        )
+        
+        # Multi-scale feature layers
+        self.layer1 = nn.Sequential(
+            nn.Conv2d(in_channels, 16, kernel_size=3, stride=2, padding=1),
+            nn.InstanceNorm2d(16),
+            nn.ReLU(inplace=True),
+        )
+        self.layer2 = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.InstanceNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+        self.layer3 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.InstanceNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        
+        # Global Cross-scale Channel Attention (112 channels)
+        self.global_ca = ChannelAttention(112, reduction=8)
+        
+        # MLP to predict the composition weights for the bank
+        self.mlp = nn.Sequential(
+            nn.Linear(112, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, num_components)
+        )
 
-        features = []
-        for block in self.conv_blocks:
-            x = F.relu(block(x), inplace=True)
-            if self.multiscale_depth > 1:
-                features.append(x)
-        if self.multiscale_depth > 1:
-            x = torch.cat(features[-self.multiscale_depth :], dim=1)
-        output_list = []
-        for block in self.out_blocks:
-            y = F.relu(block(x), inplace=True)
-            output_list.append(y)
-        out = torch.stack(output_list, dim=-1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input image (B, 2, H, W).
+        Returns:
+            out: Dynamically composed low-rank initial memory matrix (B, C, C).
+        """
+        B = x.shape[0]
+        
+        # 1. Multi-scale feature extraction
+        f1 = self.layer1(x)
+        f2 = self.layer2(f1)
+        f3 = self.layer3(f2)
+        
+        # 2. Extract channel descriptors (GAP)
+        v1 = self.gap(f1)
+        v2 = self.gap(f2)
+        v3 = self.gap(f3)
+        
+        # 3. Cross-scale concatenation and Global Attention
+        v_all = torch.cat([v1, v2, v3], dim=1)
+        v_weighted = self.global_ca(v_all).flatten(1)
+        
+        # 4. Predict weights for the low-rank banks
+        weights = self.mlp(v_weighted)  # (B, num_components)
+        weights = F.softmax(weights, dim=1)
+        
+        # 5. Compose mixed U and V bases
+        # (B, N, 1, 1) * (1, N, C, rank) -> Sum along N -> (B, C, rank)
+        w_view = weights.view(B, self.num_components, 1, 1)
+        u_mixed = (w_view * self.u_bank.unsqueeze(0)).sum(dim=1)
+        v_mixed = (w_view * self.v_bank.unsqueeze(0)).sum(dim=1)
+        
+        # 6. Generate M0 via low-rank approximation (M0 = U @ V^T)
+        out = torch.bmm(u_mixed, v_mixed.transpose(1, 2))  # (B, C, C)
+        
         return out
 
 
 class EGLAVarNet(nn.Module):
-    """Recurrent Variational Network implementation as presented in [1]_.
-
-    References
-    ----------
-
-    .. [1] Yiasemis, George, et al. “Recurrent Variational Network: A Deep Learning Inverse Problem Solver Applied to
-        the Task of Accelerated MRI Reconstruction.” ArXiv:2111.09639 [Physics], Nov. 2021. arXiv.org,
-        http://arxiv.org/abs/2111.09639.
+    """Enhanced Gated Linear Attention Variational Network (EGLAVarNet).
+    
+    Features:
+    - Gated Linear Attention (GLA) for global spatial context.
+    - Input-Adaptive Prompt Generator for memory initialization.
     """
 
     def __init__(
@@ -140,40 +167,6 @@ class EGLAVarNet(nn.Module):
         normalized: bool = False,
         **kwargs,
     ):
-        """Inits :class:`EGLAVarNet`.
-
-        Parameters
-        ----------
-        forward_operator: Callable
-            Forward Operator.
-        backward_operator: Callable
-            Backward Operator.
-        num_steps: int
-            Number of iterations :math:`T`.
-        in_channels: int
-            Input channel number. Default is 2 for complex data.
-        recurrent_hidden_channels: int
-            Hidden channels number for the recurrent unit of the GLAVarNet Blocks. Default: 64.
-        recurrent_num_layers: int
-            Number of layers for the recurrent unit of the GLAVarNet Block (:math:`n_l`). Default: 4.
-        no_parameter_sharing: bool
-            If False, the same :class:`GLAVarNetBlock` is used for all num_steps. Default: True.
-        learned_initializer: bool
-            If True an RSI module is used. Default: False.
-        initializer_initialization: str, Optional
-            Type of initialization for the RSI module. Can be either 'sense', 'zero-filled' or 'input-image'.
-            Default: None.
-        initializer_channels: tuple
-            Channels :math:`n_d` in the convolutional layers of the RSI module. Default: (32, 32, 64, 64).
-        initializer_dilations: tuple
-            Dilations :math:`p` of the convolutional layers of the RSI module. Default: (1, 1, 2, 4).
-        initializer_multiscale: int
-            RSI module number of feature layers to aggregate for the output, if 1, multi-scale context aggregation
-            is disabled. Default: 1.
-        normalized: bool
-            If True, :class:`NormConv2dGRU` will be used as a regularizer in the :class:`GLAVarNetBlocks`.
-            Default: False.
-        """
         super().__init__()
 
         extra_keys = kwargs.keys()
@@ -187,8 +180,6 @@ class EGLAVarNet(nn.Module):
         if (
             learned_initializer
             and initializer_initialization is not None
-            and initializer_channels is not None
-            and initializer_dilations is not None
         ):
             if initializer_initialization not in [
                 "sense",
@@ -200,20 +191,20 @@ class EGLAVarNet(nn.Module):
                     f"Got {initializer_initialization}."
                 )
             self.initializer_initialization = initializer_initialization
-            self.initializer = RecurrentInit(
-                in_channels,
-                recurrent_hidden_channels,
-                channels=initializer_channels,
-                dilations=initializer_dilations,
-                depth=recurrent_num_layers,
-                multiscale_depth=initializer_multiscale,
+            
+            # --- EGLAVarNet Change: Use PromptGenerator instead of RecurrentInit ---
+            self.initializer = PromptGenerator(
+                in_channels=in_channels,
+                hidden_channels=recurrent_hidden_channels
             )
+            # -----------------------------------------------------------------------
+
         self.num_steps = num_steps
         self.no_parameter_sharing = no_parameter_sharing
         self.block_list = nn.ModuleList()
         for _ in range(self.num_steps if self.no_parameter_sharing else 1):
             self.block_list.append(
-                GLAVarNetBlock(
+                EGLAVarNetBlock(
                     forward_operator=forward_operator,
                     backward_operator=backward_operator,
                     in_channels=in_channels,
@@ -286,26 +277,32 @@ class EGLAVarNet(nn.Module):
                 initializer_input_image = self.compute_sense_init(
                     kspace=masked_kspace,
                     sensitivity_map=sensitivity_map,
-                ).unsqueeze(self._coil_dim)
+                ) # (N, H, W, 2) 
+                initializer_input_image = initializer_input_image.permute(0, 3, 1, 2) # To (N, 2, H, W)
+                
             elif self.initializer_initialization == "input_image":
                 if "initial_image" not in kwargs:
                     raise ValueError(
                         f"`'initial_image` is required as input if initializer_initialization "
                         f"is {self.initializer_initialization}."
                     )
-                initializer_input_image = kwargs["initial_image"].unsqueeze(self._coil_dim)
+                initializer_input_image = kwargs["initial_image"] # Assuming (N, H, W, 2)
+                initializer_input_image = initializer_input_image.permute(0, 3, 1, 2)
+
             elif self.initializer_initialization == "zero_filled":
                 initializer_input_image = self.backward_operator(masked_kspace, dim=self._spatial_dims)
+                initializer_input_image = initializer_input_image.sum(self._coil_dim) # RSS or Sum?
+                initializer_input_image = initializer_input_image.permute(0, 3, 1, 2)
 
-            # previous_state = self.initializer(
-            #     self.forward_operator(initializer_input_image, dim=self._spatial_dims)
-            #     .sum(self._coil_dim)
-            #     .permute(0, 3, 1, 2)
-            # )
-            # GLA Adaptation: The RecurrentInit module outputs spatial hidden states for Conv2dGRU.
-            # GLA expects a global memory matrix [B, L, C, C].
-            # For now, we disable the explicit initialization from RecurrentInit and start with zero memory.
-            previous_state = None
+            # --- EGLAVarNet Change: Generate Adaptive Memory ---
+            # Input: (N, 2, H, W)
+            # Output: (N, C, C) - This is our Prompt-initialized Memory
+            previous_state = self.initializer(initializer_input_image)
+            
+            # Replicate memory across recurrent layers (B, L, C, C)
+            num_layers_recurrent = self.block_list[0].regularizer.num_layers
+            previous_state = previous_state.unsqueeze(1).repeat(1, num_layers_recurrent, 1, 1) # (B, L, C, C)
+            # ---------------------------------------------------
 
         kspace_prediction = masked_kspace.clone()
 
@@ -325,15 +322,7 @@ class EGLAVarNet(nn.Module):
 
 
 class GatedLinearAttention(nn.Module):
-    """Gated Linear Attention (GLA) module with Recurrent Form (O(1) inference memory).
-
-    This module implements a global attention mechanism that maintains a fixed-size memory matrix
-    updated at each iteration, rather than storing all historical feature maps.
-
-    References
-    ----------
-    Inspired by Linear Attention and Gated Linear Networks theories.
-    """
+    """Gated Linear Attention (GLA) module with Recurrent Form (O(1) inference memory)."""
 
     def __init__(self, hidden_channels: int):
         super().__init__()
@@ -355,23 +344,10 @@ class GatedLinearAttention(nn.Module):
         self.proj = nn.Conv2d(hidden_channels, hidden_channels, 1)
 
     def forward(
-        self, x: torch.Tensor, prev_memory: Optional[torch.Tensor] = None
+        self,
+        x: torch.Tensor,
+        prev_memory: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input feature map of shape (B, C, H, W).
-        prev_memory : torch.Tensor, optional
-            Previous global memory matrix of shape (B, C, C).
-
-        Returns
-        -------
-        out : torch.Tensor
-            Output feature map of shape (B, C, H, W).
-        new_memory : torch.Tensor
-            Updated global memory matrix of shape (B, C, C).
-        """
         B, C, H, W = x.shape
         N = H * W
 
@@ -379,32 +355,22 @@ class GatedLinearAttention(nn.Module):
         x_norm = self.norm(x)
 
         # 1. Project inputs to Q, K, V, and Gates
-        q = self.to_q(x_norm).view(B, C, N) * self.scale  # Apply scale for stability
+        q = self.to_q(x_norm).view(B, C, N) * self.scale
         k = self.to_k(x_norm).view(B, C, N)
         v = self.to_v(x_norm).view(B, C, N)
 
         gates = self.to_gates(x_norm).view(B, 2 * C, N)
         forget_gate_spatial, input_gate_spatial = gates.chunk(2, dim=1)
-        forget_gate_spatial = torch.sigmoid(forget_gate_spatial)  # lambda_t (B, C, N)
-        input_gate_spatial = torch.sigmoid(input_gate_spatial)  # i_t (B, C, N)
+        forget_gate_spatial = torch.sigmoid(forget_gate_spatial)
+        input_gate_spatial = torch.sigmoid(input_gate_spatial)
 
         # 2. Compute New Knowledge (Aggregation)
-        # We want to compute: sum_{spatial} (input_gate * K)^T * V
-        # (B, C, N) -> (B, N, C) @ (B, N, C) is expensive if we transpose N.
-        # Let's optimize: (input_gate * k) @ v.T
-        # Shape: (B, C, N) @ (B, N, C) -> (B, C, C)
-        # Note: (i * K) is element-wise.
-        k_gated = k * input_gate_spatial  # (B, C, N)
+        k_gated = k * input_gate_spatial
         # Normalize by N to prevent memory explosion with large images
-        new_knowledge = torch.bmm(k_gated, v.transpose(1, 2)) / N  # (B, C, C)
+        new_knowledge = torch.bmm(k_gated, v.transpose(1, 2)) / N
 
         # 3. Update Global Memory
-        # Compute global forgetting factor.
-        # We can take the mean of spatial forget gates to get a global forget gate for the matrix.
-        # global_forget_gate = forget_gate_spatial.mean(dim=2).unsqueeze(2)  # (B, C, 1) -> broadcasting to (B, C, C)
-        # Alternatively, simpler element-wise decay if prev_memory is (B, C, C).
-        # Let's use a learned global scalar/vector derived from spatial map for stability.
-        global_forget_gate = forget_gate_spatial.mean(dim=2).unsqueeze(2)  # (B, C, 1)
+        global_forget_gate = forget_gate_spatial.mean(dim=2).unsqueeze(2)
 
         if prev_memory is None:
             prev_memory = torch.zeros(
@@ -415,22 +381,9 @@ class GatedLinearAttention(nn.Module):
         new_memory = global_forget_gate * prev_memory + new_knowledge
 
         # 4. Retrieval (Personalized Query)
-        # Output = Q @ M_t
-        # Shape: (B, N, C) @ (B, C, C) -> (B, N, C) -> transpose back to (B, C, N)
-        # Wait, Q is (B, C, N). So we want Q.T @ M_t ?
-        # Query vector q_i is (1, C). M is (C, C). Result is (1, C).
-        # So we want result of shape (B, C, N).
-        # result_column = M.T @ q_column ?
-        # Let's look at algebra: y = q^T M. (where q is column vector C x 1).
-        # If Q is (B, C, N), then we treat it as N column vectors.
-        # result = M_t.transpose(1, 2) @ Q ? No.
-        # Let's stick to the user's formula: Output = Q_point . M
-        # If Q_point is row vector (1, C): result is (1, C).
-        # Here Q is (B, C, N), so it's N column vectors.
-        # Let's view Q as (B, N, C) (batch of N row vectors).
-        q_rows = q.transpose(1, 2)  # (B, N, C)
-        retrieved = torch.bmm(q_rows, new_memory)  # (B, N, C) @ (B, C, C) -> (B, N, C)
-        retrieved = retrieved.transpose(1, 2).view(B, C, H, W)  # (B, C, H, W)
+        q_rows = q.transpose(1, 2)
+        retrieved = torch.bmm(q_rows, new_memory)
+        retrieved = retrieved.transpose(1, 2).view(B, C, H, W)
 
         # 5. Fusion
         out = self.proj(retrieved) + x
@@ -464,32 +417,17 @@ class GLARecurrentUnit(nn.Module):
         self.output_proj = nn.Conv2d(hidden_channels, in_channels, 3, padding=1)
 
     def forward(
-        self, x: torch.Tensor, hidden_states: Optional[torch.Tensor] = None
+        self,
+        x: torch.Tensor,
+        hidden_states: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input (recurrent term) of shape (B, in_channels, H, W).
-        hidden_states : torch.Tensor, optional
-            Stacked memory matrices of shape (B, num_layers, C, C).
-
-        Returns
-        -------
-        out : torch.Tensor
-            Updated input of shape (B, in_channels, H, W).
-        new_hidden_states : torch.Tensor
-            Updated memory matrices of shape (B, num_layers, C, C).
-        """
         # Lift to hidden dimension
-        feat = self.input_proj(x)  # (B, C, H, W)
+        feat = self.input_proj(x)
 
         new_states_list = []
         if hidden_states is None:
-            # Initialize with None
             current_states = [None] * self.num_layers
         else:
-            # Unbind the stacked states: (B, L, C, C) -> List of (B, C, C)
             current_states = hidden_states.unbind(dim=1)
 
         for i, layer in enumerate(self.layers):
@@ -497,8 +435,7 @@ class GLARecurrentUnit(nn.Module):
             feat, new_mem = layer(feat, prev_mem)
             new_states_list.append(new_mem)
 
-        # Stack new states
-        new_hidden_states = torch.stack(new_states_list, dim=1)  # (B, L, C, C)
+        new_hidden_states = torch.stack(new_states_list, dim=1)
 
         # Project back to input dimension and add residual
         out = self.output_proj(feat) + x
@@ -506,11 +443,8 @@ class GLARecurrentUnit(nn.Module):
         return out, new_hidden_states
 
 
-class GLAVarNetBlock(nn.Module):
-    r"""Gated Linear Attention Variational Network Block :math:`\mathcal{H}_{\theta_{t}}`.
-    
-    This block uses GLARecurrentUnit instead of Conv2dGRU.
-    """
+class EGLAVarNetBlock(nn.Module):
+    r"""Enhanced Gated Linear Attention Variational Network Block."""
 
     def __init__(
         self,
@@ -521,35 +455,16 @@ class GLAVarNetBlock(nn.Module):
         num_layers: int = 4,
         normalized: bool = False,
     ):
-        """Inits GLAVarNetBlock.
-
-        Parameters
-        ----------
-        forward_operator: Callable
-            Forward Fourier Transform.
-        backward_operator: Callable
-            Backward Fourier Transform.
-        in_channels: int,
-            Input channel number. Default is 2 for complex data.
-        hidden_channels: int,
-            Hidden channels. Default: 64.
-        num_layers: int,
-            Number of layers of :math:`n_l` recurrent unit. Default: 4.
-        normalized: bool
-            If True, :class:`NormConv2dGRU` will be used as a regularizer. Default: False.
-        """
         super().__init__()
         self.forward_operator = forward_operator
         self.backward_operator = backward_operator
 
-        self.learning_rate = nn.Parameter(torch.tensor([1.0]))  # :math:`\alpha_t`
+        self.learning_rate = nn.Parameter(torch.tensor([1.0]))
         regularizer_params = {
             "in_channels": in_channels,
             "hidden_channels": hidden_channels,
             "num_layers": num_layers,
-            # "replication_padding": True, # GLA uses standard padding in projections
         }
-        # Replaced Conv2dGRU with GLARecurrentUnit
         self.regularizer = GLARecurrentUnit(**regularizer_params)
 
     def forward(
@@ -562,33 +477,6 @@ class GLAVarNetBlock(nn.Module):
         coil_dim: int = 1,
         spatial_dims: Tuple[int, int] = (2, 3),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Computes forward pass of GLAVarNetBlock.
-
-        Parameters
-        ----------
-        current_kspace: torch.Tensor
-            Current k-space prediction of shape (N, coil, height, width, complex=2).
-        masked_kspace: torch.Tensor
-            Masked k-space of shape (N, coil, height, width, complex=2).
-        sampling_mask: torch.Tensor
-            Sampling mask of shape (N, 1, height, width, 1).
-        sensitivity_map: torch.Tensor
-            Coil sensitivities of shape (N, coil, height, width, complex=2).
-        hidden_state: torch.Tensor or None
-            Recurrent unit hidden state of shape (N, L, C, C) if not None. Optional.
-        coil_dim: int
-            Coil dimension. Default: 1.
-        spatial_dims: tuple of ints
-            Spatial dimensions. Default: (2, 3).
-
-        Returns
-        -------
-        new_kspace: torch.Tensor
-            New k-space prediction of shape (N, coil, height, width, complex=2).
-        hidden_state: torch.Tensor
-            Next hidden state of shape (N, L, C, C).
-        """
-
         kspace_error = torch.where(
             sampling_mask == 0,
             torch.tensor([0.0], dtype=masked_kspace.dtype).to(masked_kspace.device),
@@ -601,7 +489,7 @@ class GLAVarNetBlock(nn.Module):
             dim=coil_dim,
         ).permute(0, 3, 1, 2)
 
-        recurrent_term, hidden_state = self.regularizer(recurrent_term, hidden_state)  # :math:`w_t`, :math:`h_{t+1}`
+        recurrent_term, hidden_state = self.regularizer(recurrent_term, hidden_state)
         recurrent_term = recurrent_term.permute(0, 2, 3, 1)
 
         recurrent_term = self.forward_operator(
@@ -611,4 +499,4 @@ class GLAVarNetBlock(nn.Module):
 
         new_kspace = current_kspace - self.learning_rate * kspace_error + recurrent_term
 
-        return new_kspace, hidden_state  # type: ignore
+        return new_kspace, hidden_state
