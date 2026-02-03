@@ -17,6 +17,7 @@ from typing import Callable, DefaultDict, Dict, Optional, Union
 
 import h5py  # type: ignore
 import numpy as np
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ def write_output_to_h5(
         # Create output directory
         output_directory.mkdir(exist_ok=True, parents=True)
 
-    for idx, (volume, _, filename) in enumerate(output):
+    for idx, (volume, extra_data, filename) in enumerate(output):
         # The output has shape (slice, 1, height, width)
         if isinstance(filename, pathlib.PosixPath):
             filename = filename.name
@@ -64,5 +65,43 @@ def write_output_to_h5(
         if volume_processing_func:
             reconstruction = volume_processing_func(reconstruction)
 
+        # Smart reshaping based on tvec
+        if extra_data and "tvec" in extra_data:
+            tvec = extra_data["tvec"]
+            if isinstance(tvec, torch.Tensor):
+                tvec_shape = tvec.shape
+            else:
+                tvec_shape = tvec.shape
+            
+            # tvec shape is typically (Batch, Slices, Time) e.g. (1, 5, 9)
+            # reconstruction shape is (Total_Slices, H, W) e.g. (45, 512, 144)
+            if len(tvec_shape) == 3:
+                slices, time = tvec_shape[1], tvec_shape[2]
+                if reconstruction.shape[0] == slices * time:
+                    logger.info(f"Reshaping reconstruction from {reconstruction.shape} to ({slices}, {time}, ...)")
+                    # Dataset iterates Time-Major (Time, Slice), so reshape to (Time, Slice) first
+                    reconstruction = reconstruction.reshape(time, slices, reconstruction.shape[1], reconstruction.shape[2])
+                    # Then transpose to (Slice, Time) to match tvec
+                    reconstruction = reconstruction.transpose(1, 0, 2, 3)
+
         with h5py.File(output_directory / filename, "w") as f:
             f.create_dataset(output_key, data=reconstruction)
+            if extra_data:
+                logger.info(f"Writing extra data keys: {list(extra_data.keys())}")
+                for key, value in extra_data.items():
+                    if key == output_key:
+                        continue
+                    
+                    if isinstance(value, torch.Tensor):
+                        value = value.numpy()
+                    
+                    # Squeeze singleton batch dimension if present
+                    if value.ndim > 0 and value.shape[0] == 1:
+                        value = value.squeeze(0)
+
+                    try:
+                        f.create_dataset(key, data=value)
+                    except Exception as e:
+                        logger.error(f"Failed to write key {key}: {e}")
+            else:
+                logger.warning(f"No extra data found for {filename}")

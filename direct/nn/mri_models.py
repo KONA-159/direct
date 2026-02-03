@@ -788,6 +788,7 @@ class MRIModelEngine(Engine):
         last_filename = None  # At the start of evaluation, there are no filenames.
         curr_volume = None
         curr_target = None
+        curr_extra_data = {}
         slice_counter = 0
         filenames_seen = 0
 
@@ -807,6 +808,7 @@ class MRIModelEngine(Engine):
             if last_filename != filename:
                 curr_volume = None
                 curr_target = None
+                curr_extra_data = {}  # Reset extra data container
                 slice_counter = 0
                 last_filename = filename
 
@@ -847,6 +849,15 @@ class MRIModelEngine(Engine):
             if add_target:
                 curr_target[slice_counter : slice_counter + output_abs.shape[0], ...] = target_abs.cpu()  # type: ignore
 
+            # Collect global metadata (tvec, masks)
+            # We assume these are volume-level metadata and do not need to be stacked/sliced per batch
+            if "tvec" in data:
+                curr_extra_data["tvec"] = data["tvec"].cpu()
+            
+            for k, v in data.items():
+                if k.startswith("mask"):
+                    curr_extra_data[k] = v.cpu()
+
             slice_counter += output_abs.shape[0]
 
             # Check if we had the last batch
@@ -864,12 +875,13 @@ class MRIModelEngine(Engine):
                 # Maybe not needed.
                 del data
                 yield (
-                    (curr_volume, curr_target, reduce_list_of_dicts(loss_dict_list), filename)
+                    (curr_volume, curr_target, reduce_list_of_dicts(loss_dict_list), filename, curr_extra_data)
                     if add_target
                     else (
                         curr_volume,
                         reduce_list_of_dicts(loss_dict_list),
                         filename,
+                        curr_extra_data,
                     )
                 )
 

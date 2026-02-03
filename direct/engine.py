@@ -302,7 +302,10 @@ class Engine(ABC, DataDimensionality):
                     # =================================================================
 
         output = list(self.reconstruct_volumes(data_loader, add_target=False, crop=crop))
-        return output
+        # Each element in output is now: (volume, reduce_list_of_dicts(loss_dict_list), filename, curr_extra_data)
+        # We transform it to a format that writers can easily consume: (volume, extra_data, filename)
+        formatted_output = [(item[0], item[3], item[2]) for item in output]
+        return formatted_output
 
     @staticmethod
     def build_loader(
