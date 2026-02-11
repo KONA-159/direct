@@ -761,7 +761,7 @@ class CMRxReconDataset(Dataset):
 
         if extra_keys:
             for extra_key in self.extra_keys:
-                extra_data[extra_key] = data[extra_key][()]
+                extra_data[extra_key] = np.array(data[extra_key][()])
         data.close()
         return curr_data, extra_data
 
