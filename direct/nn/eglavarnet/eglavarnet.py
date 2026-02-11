@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from direct.constants import COMPLEX_SIZE
 from direct.data.transforms import complex_multiplication, conjugate, expand_operator, reduce_operator
@@ -308,15 +309,28 @@ class EGLAVarNet(nn.Module):
 
         for step in range(self.num_steps):
             block = self.block_list[step] if self.no_parameter_sharing else self.block_list[0]
-            kspace_prediction, previous_state = block(
-                kspace_prediction,
-                masked_kspace,
-                sampling_mask,
-                sensitivity_map,
-                previous_state,
-                self._coil_dim,
-                self._spatial_dims,
-            )
+            if self.training:
+                kspace_prediction, previous_state = checkpoint(
+                    block,
+                    kspace_prediction,
+                    masked_kspace,
+                    sampling_mask,
+                    sensitivity_map,
+                    previous_state,
+                    self._coil_dim,
+                    self._spatial_dims,
+                    use_reentrant=False
+                )
+            else:
+                kspace_prediction, previous_state = block(
+                    kspace_prediction,
+                    masked_kspace,
+                    sampling_mask,
+                    sensitivity_map,
+                    previous_state,
+                    self._coil_dim,
+                    self._spatial_dims,
+                )
 
         return kspace_prediction
 
