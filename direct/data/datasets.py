@@ -828,6 +828,11 @@ class CMRxReconDataset(Dataset):
             # If context put coil dim first
             sample["kspace"] = np.swapaxes(sample["kspace"], 0, 1)
 
+        # Force all numpy arrays to be contiguous to prevent PyTorch DataLoader errors
+        for key in sample:
+            if isinstance(sample[key], np.ndarray):
+                sample[key] = np.array(sample[key], copy=True)
+
         if self.transform:
             sample = self.transform(sample)
 
